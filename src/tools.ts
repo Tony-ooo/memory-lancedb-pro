@@ -95,9 +95,9 @@ export function registerSelfImprovementLogTool(api: OpenClawPluginApi, context: 
     (toolCtx) => ({
       name: "self_improvement_log",
       label: "Self-Improvement Log",
-      description: "Log structured learning/error/feature-request entries into .learnings for governance and later distillation.",
+      description: "Log structured learning/error entries into .learnings for governance and later distillation.",
       parameters: Type.Object({
-        type: stringEnum(["learning", "error", "feature"]),
+        type: stringEnum(["learning", "error"]),
         summary: Type.String({ description: "One-line summary" }),
         details: Type.Optional(Type.String({ description: "Detailed context or error output" })),
         suggestedAction: Type.Optional(Type.String({ description: "Concrete action to prevent recurrence" })),
@@ -115,7 +115,7 @@ export function registerSelfImprovementLogTool(api: OpenClawPluginApi, context: 
           area = "config",
           priority = "medium",
         } = params as {
-          type: "learning" | "error" | "feature";
+          type: "learning" | "error";
           summary: string;
           details?: string;
           suggestedAction?: string;
@@ -136,7 +136,7 @@ export function registerSelfImprovementLogTool(api: OpenClawPluginApi, context: 
             priority,
             source: "memory-lancedb-pro/self_improvement_log",
           });
-          const fileName = type === "learning" ? "LEARNINGS.md" : type === "error" ? "ERRORS.md" : "FEATURE_REQUESTS.md";
+          const fileName = type === "learning" ? "LEARNINGS.md" : "ERRORS.md";
 
           return {
             content: [{ type: "text", text: `Logged ${type} entry ${entryId} to .learnings/${fileName}` }],
@@ -163,20 +163,20 @@ export function registerSelfImprovementExtractSkillTool(api: OpenClawPluginApi, 
       parameters: Type.Object({
         learningId: Type.String({ description: "Learning ID like LRN-YYYYMMDD-001" }),
         skillName: Type.String({ description: "Skill folder name, lowercase with hyphens" }),
-        sourceFile: Type.Optional(stringEnum(["LEARNINGS.md", "ERRORS.md", "FEATURE_REQUESTS.md"])),
+        sourceFile: Type.Optional(stringEnum(["LEARNINGS.md", "ERRORS.md"])),
         outputDir: Type.Optional(Type.String({ description: "Relative output dir under workspace (default: skills)" })),
       }),
       async execute(_toolCallId, params) {
         const { learningId, skillName, sourceFile = "LEARNINGS.md", outputDir = "skills" } = params as {
           learningId: string;
           skillName: string;
-          sourceFile?: "LEARNINGS.md" | "ERRORS.md" | "FEATURE_REQUESTS.md";
+          sourceFile?: "LEARNINGS.md" | "ERRORS.md";
           outputDir?: string;
         };
         try {
-          if (!/^(LRN|ERR|FEAT)-\d{8}-\d{3}$/.test(learningId)) {
+          if (!/^(LRN|ERR)-\d{8}-\d{3}$/.test(learningId)) {
             return {
-              content: [{ type: "text", text: "Invalid learningId format. Use LRN-YYYYMMDD-001 / ERR-... / FEAT-..." }],
+              content: [{ type: "text", text: "Invalid learningId format. Use LRN-YYYYMMDD-001 / ERR-..." }],
               details: { error: "invalid_learning_id" },
             };
           }
@@ -285,7 +285,7 @@ export function registerSelfImprovementReviewTool(api: OpenClawPluginApi, contex
           const workspaceDir = resolveWorkspaceDir(toolCtx, context.workspaceDir);
           await ensureSelfImprovementLearningFiles(workspaceDir);
           const learningsDir = join(workspaceDir, ".learnings");
-          const files = ["LEARNINGS.md", "ERRORS.md", "FEATURE_REQUESTS.md"] as const;
+          const files = ["LEARNINGS.md", "ERRORS.md"] as const;
           const stats = { pending: 0, high: 0, promoted: 0, total: 0 };
 
           for (const f of files) {

@@ -13,12 +13,6 @@ Append structured entries:
 - ERR-YYYYMMDD-XXX for command/tool/integration failures
 - Include symptom, context, probable cause, and prevention`;
 
-export const DEFAULT_FEATURE_REQUESTS_TEMPLATE = `# Feature Requests
-
-Append structured entries:
-- FEAT-YYYYMMDD-XXX for missing capabilities
-- Include requested behavior, user context, and suggested implementation`;
-
 const fileWriteQueues = new Map<string, Promise<void>>();
 
 async function withFileWriteQueue<T>(filePath: string, action: () => Promise<T>): Promise<T> {
@@ -45,7 +39,7 @@ function todayYmd(): string {
   return new Date().toISOString().slice(0, 10).replace(/-/g, "");
 }
 
-async function nextLearningId(filePath: string, prefix: "LRN" | "ERR" | "FEAT"): Promise<string> {
+async function nextLearningId(filePath: string, prefix: "LRN" | "ERR"): Promise<string> {
   const date = todayYmd();
   let count = 0;
   try {
@@ -74,12 +68,11 @@ export async function ensureSelfImprovementLearningFiles(baseDir: string): Promi
 
   await ensureFile(join(learningsDir, "LEARNINGS.md"), DEFAULT_LEARNINGS_TEMPLATE);
   await ensureFile(join(learningsDir, "ERRORS.md"), DEFAULT_ERRORS_TEMPLATE);
-  await ensureFile(join(learningsDir, "FEATURE_REQUESTS.md"), DEFAULT_FEATURE_REQUESTS_TEMPLATE);
 }
 
 export interface AppendSelfImprovementEntryParams {
   baseDir: string;
-  type: "learning" | "error" | "feature";
+  type: "learning" | "error";
   summary: string;
   details?: string;
   suggestedAction?: string;
@@ -107,9 +100,9 @@ export async function appendSelfImprovementEntry(params: AppendSelfImprovementEn
 
   await ensureSelfImprovementLearningFiles(baseDir);
   const learningsDir = join(baseDir, ".learnings");
-  const fileName = type === "learning" ? "LEARNINGS.md" : type === "error" ? "ERRORS.md" : "FEATURE_REQUESTS.md";
+  const fileName = type === "learning" ? "LEARNINGS.md" : "ERRORS.md";
   const filePath = join(learningsDir, fileName);
-  const idPrefix = type === "learning" ? "LRN" : type === "error" ? "ERR" : "FEAT";
+  const idPrefix = type === "learning" ? "LRN" : "ERR";
 
   const id = await withFileWriteQueue(filePath, async () => {
     const entryId = await nextLearningId(filePath, idPrefix);

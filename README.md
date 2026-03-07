@@ -162,7 +162,7 @@ Filters out low-quality content at both auto-capture and tool-store stages:
 - Hooks: `agent:bootstrap`, `command:new`, `command:reset`
 - `agent:bootstrap`: injects `SELF_IMPROVEMENT_REMINDER.md` into bootstrap context
 - `command:new` / `command:reset`: appends a short `/note self-improvement ...` reminder before reset
-- Files: ensures `.learnings/LEARNINGS.md`, `.learnings/ERRORS.md`, `.learnings/FEATURE_REQUESTS.md`
+- Files: ensures `.learnings/LEARNINGS.md`, `.learnings/ERRORS.md`
 - Behavior note:
   - This flow is integrated into the plugin lifecycle and can coexist with `sessionStrategy=systemSessionMemory`.
   - It is separate from `memoryReflection`: seeing self-improvement notes or `.learnings/*` activity does not by itself mean reflection storage is enabled.

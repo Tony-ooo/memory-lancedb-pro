@@ -158,7 +158,6 @@ After completing tasks, evaluate if any learnings should be captured:
 **Log when:**
 - User corrects you -> .learnings/LEARNINGS.md
 - Command/operation fails -> .learnings/ERRORS.md
-- User wants missing capability -> .learnings/FEATURE_REQUESTS.md
 - You discover your knowledge was wrong -> .learnings/LEARNINGS.md
 - You find a better approach -> .learnings/LEARNINGS.md
 
@@ -1658,7 +1657,6 @@ const memoryLanceDBProPlugin = {
                 "- If anything was learned/corrected, log it now:",
                 "  - .learnings/LEARNINGS.md (corrections/best practices)",
                 "  - .learnings/ERRORS.md (failures/root causes)",
-                "  - .learnings/FEATURE_REQUESTS.md (missing capability)",
                 "- Distill reusable rules to AGENTS.md / SOUL.md / TOOLS.md.",
                 "- If reusable across tasks, extract a new skill from the learning.",
                 "- Then proceed with the new session.",

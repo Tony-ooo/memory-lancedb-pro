@@ -162,7 +162,7 @@ Query → BM25 FTS ─────┘
 - 触发事件：`agent:bootstrap`、`command:new`、`command:reset`
 - `agent:bootstrap`：注入 `SELF_IMPROVEMENT_REMINDER.md` 到 bootstrap 上下文
 - `command:new` / `command:reset`：在会话重置前注入简短 `/note self-improvement ...` 提醒
-- 文件：确保 `.learnings/LEARNINGS.md`、`.learnings/ERRORS.md`、`.learnings/FEATURE_REQUESTS.md` 存在
+- 文件：确保 `.learnings/LEARNINGS.md`、`.learnings/ERRORS.md` 存在
 - 行为说明：
   - 这条链路集成在插件生命周期内，可与 `sessionStrategy=systemSessionMemory` 共存。
   - 它与 `memoryReflection` 是分开的：看到 self-improvement note 或 `.learnings/*` 写入，并不等于 reflection 存储已经开启。
