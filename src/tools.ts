@@ -56,6 +56,13 @@ interface ToolContext {
   workspaceDir?: string;
   mdMirror?: MdMirrorWriter | null;
   admissionControl?: AdmissionControlConfig;
+  onMemoryStoreWrite?: (entry: {
+    sessionKey: string;
+    text: string;
+    category: string;
+    scope: string;
+    id: string;
+  }) => void;
 }
 
 function resolveAgentId(runtimeAgentId: unknown, fallback?: string): string | undefined {
@@ -665,6 +672,16 @@ export function registerMemoryStoreTool(
               ),
             ),
           });
+
+          if (sourceSession && sourceSession !== "unknown") {
+            context.onMemoryStoreWrite?.({
+              sessionKey: sourceSession,
+              text,
+              category: category as string,
+              scope: targetScope,
+              id: entry.id,
+            });
+          }
 
           // Dual-write to Markdown mirror if enabled
           if (context.mdMirror) {

@@ -567,6 +567,558 @@ assert.ok(
   ),
 );
 
+function createTargetedEmbeddingServer() {
+  const makeVector = (x, y = 0) => {
+    const vector = new Array(EMBEDDING_DIMENSIONS).fill(0);
+    vector[0] = x;
+    vector[1] = y;
+    return vector;
+  };
+
+  const structuredToolVector = makeVector(1, 0);
+  const explicitRememberVector = makeVector(0.85, Math.sqrt(1 - 0.85 ** 2));
+  const defaultVector = makeVector(0, 1);
+
+  return http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/v1/embeddings") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const inputs = Array.isArray(payload.input) ? payload.input : [payload.input];
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      object: "list",
+      data: inputs.map((input, index) => {
+        const text = String(input);
+        let embedding = defaultVector;
+        if (text === "Master uses OpenClaw daily; common AI coding tools include Claude Code and Codex.") {
+          embedding = structuredToolVector;
+        } else if (text.includes("请记住，我每天都用OpenClaw")) {
+          embedding = explicitRememberVector;
+        }
+        return {
+          object: "embedding",
+          index,
+          embedding,
+        };
+      }),
+      model: payload.model || "mock-embedding-model",
+      usage: {
+        prompt_tokens: 0,
+        total_tokens: 0,
+      },
+    }));
+  });
+}
+
+async function runSameTurnMemoryStoreRegexFallbackSuppressionScenario() {
+  const workDir = mkdtempSync(path.join(tmpdir(), "memory-smart-tool-fallback-"));
+  const dbPath = path.join(workDir, "db");
+  const logs = [];
+  const embeddingServer = createTargetedEmbeddingServer();
+
+  const server = http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/chat/completions") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const prompt = payload.messages?.[1]?.content || "";
+
+    let content = JSON.stringify({ memories: [] });
+    if (prompt.includes("Analyze the following session context")) {
+      content = JSON.stringify({ memories: [] });
+    }
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: "chatcmpl-test",
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: "mock-memory-model",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content },
+          finish_reason: "stop",
+        },
+      ],
+    }));
+  });
+
+  await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const embeddingPort = embeddingServer.address().port;
+  const port = server.address().port;
+  process.env.TEST_EMBEDDING_BASE_URL = `http://127.0.0.1:${embeddingPort}/v1`;
+
+  try {
+    const api = createMockApi(
+      dbPath,
+      `http://127.0.0.1:${embeddingPort}/v1`,
+      `http://127.0.0.1:${port}`,
+      logs,
+    );
+    plugin.register(api);
+
+    const memoryStoreTool = api.toolFactories.memory_store({
+      agentId: "life",
+      sessionKey: "agent:life:test",
+    });
+
+    const toolResult = await memoryStoreTool.execute(
+      "call-memory-store",
+      {
+        text: "Master uses OpenClaw daily; common AI coding tools include Claude Code and Codex.",
+        importance: 0.78,
+        category: "preference",
+        scope: "agent:life",
+      },
+      undefined,
+      undefined,
+      { agentId: "life", sessionKey: "agent:life:test" },
+    );
+
+    assert.equal(toolResult.details.action, "created");
+
+    await api.hooks.agent_end(
+      {
+        success: true,
+        sessionKey: "agent:life:test",
+        messages: [
+          {
+            role: "user",
+            content: "请记住，我每天都用OpenClaw，我的常用AI Coding工具包括CLaude Code、Codex等",
+          },
+        ],
+      },
+      { agentId: "life", sessionKey: "agent:life:test" },
+    );
+
+    const freshStore = new MemoryStore({ dbPath, vectorDim: EMBEDDING_DIMENSIONS });
+    const entries = await freshStore.list(["agent:life"], undefined, 10, 0);
+    return { entries, logs };
+  } finally {
+    delete process.env.TEST_EMBEDDING_BASE_URL;
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+const sameTurnMemoryStoreFallbackResult =
+  await runSameTurnMemoryStoreRegexFallbackSuppressionScenario();
+assert.equal(sameTurnMemoryStoreFallbackResult.entries.length, 1);
+assert.equal(
+  sameTurnMemoryStoreFallbackResult.entries[0].text,
+  "Master uses OpenClaw daily; common AI coding tools include Claude Code and Codex.",
+);
+assert.ok(
+  sameTurnMemoryStoreFallbackResult.logs.some((entry) =>
+    entry[1].includes("smart extraction produced no persisted memories")
+  ),
+);
+assert.ok(
+  sameTurnMemoryStoreFallbackResult.logs.some((entry) =>
+    entry[1].includes("regex fallback skipped same-turn memory_store duplicate")
+  ),
+);
+assert.ok(
+  sameTurnMemoryStoreFallbackResult.logs.every((entry) =>
+    !entry[1].includes("auto-captured 1 memories")
+  ),
+);
+
+function createMultiCoverageEmbeddingServer() {
+  const makeVector = (...values) => {
+    const vector = new Array(EMBEDDING_DIMENSIONS).fill(0);
+    for (let i = 0; i < values.length; i += 1) {
+      vector[i] = values[i];
+    }
+    return vector;
+  };
+
+  const preferenceVector = makeVector(1, 0);
+  const founderVector = makeVector(0, 1);
+  const combinedValue = Math.SQRT1_2;
+  const combinedVector = makeVector(combinedValue, combinedValue);
+  const defaultVector = makeVector(0, 0, 1);
+
+  return http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/v1/embeddings") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const inputs = Array.isArray(payload.input) ? payload.input : [payload.input];
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      object: "list",
+      data: inputs.map((input, index) => {
+        const text = String(input);
+        let embedding = defaultVector;
+        if (text === "User (Master) uses OpenClaw daily; common AI coding tools: Claude Code and Codex.") {
+          embedding = preferenceVector;
+        } else if (text === "User (Master) is the founder of the memory-lancedb-pro project: https://github.com/CortexReach/memory-lancedb-pro") {
+          embedding = founderVector;
+        } else if (text.includes("请记住，我每天都用OpenClaw") && text.includes("我是项目的创始人")) {
+          embedding = combinedVector;
+        }
+        return {
+          object: "embedding",
+          index,
+          embedding,
+        };
+      }),
+      model: payload.model || "mock-embedding-model",
+      usage: {
+        prompt_tokens: 0,
+        total_tokens: 0,
+      },
+    }));
+  });
+}
+
+async function runSameTurnMultiMemoryStoreCoverageScenario() {
+  const workDir = mkdtempSync(path.join(tmpdir(), "memory-smart-tool-multi-"));
+  const dbPath = path.join(workDir, "db");
+  const logs = [];
+  const embeddingServer = createMultiCoverageEmbeddingServer();
+
+  const server = http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/chat/completions") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const prompt = payload.messages?.[1]?.content || "";
+
+    let content = JSON.stringify({ memories: [] });
+    if (prompt.includes("Analyze the following session context")) {
+      content = JSON.stringify({ memories: [] });
+    }
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: "chatcmpl-test",
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: "mock-memory-model",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content },
+          finish_reason: "stop",
+        },
+      ],
+    }));
+  });
+
+  await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const embeddingPort = embeddingServer.address().port;
+  const port = server.address().port;
+  process.env.TEST_EMBEDDING_BASE_URL = `http://127.0.0.1:${embeddingPort}/v1`;
+
+  try {
+    const api = createMockApi(
+      dbPath,
+      `http://127.0.0.1:${embeddingPort}/v1`,
+      `http://127.0.0.1:${port}`,
+      logs,
+    );
+    plugin.register(api);
+
+    const memoryStoreTool = api.toolFactories.memory_store({
+      agentId: "life",
+      sessionKey: "agent:life:test",
+    });
+
+    const preferenceResult = await memoryStoreTool.execute(
+      "call-memory-store-preference",
+      {
+        text: "User (Master) uses OpenClaw daily; common AI coding tools: Claude Code and Codex.",
+        importance: 0.8,
+        category: "preference",
+        scope: "agent:life",
+      },
+      undefined,
+      undefined,
+      { agentId: "life", sessionKey: "agent:life:test" },
+    );
+    assert.equal(preferenceResult.details.action, "created");
+
+    const founderResult = await memoryStoreTool.execute(
+      "call-memory-store-founder",
+      {
+        text: "User (Master) is the founder of the memory-lancedb-pro project: https://github.com/CortexReach/memory-lancedb-pro",
+        importance: 0.85,
+        category: "fact",
+        scope: "agent:life",
+      },
+      undefined,
+      undefined,
+      { agentId: "life", sessionKey: "agent:life:test" },
+    );
+    assert.equal(founderResult.details.action, "created");
+
+    await api.hooks.agent_end(
+      {
+        success: true,
+        sessionKey: "agent:life:test",
+        messages: [
+          {
+            role: "user",
+            content:
+              "请记住，我每天都用OpenClaw，我的常用AI Coding工具包括Claude Code、Codex等！我是项目的创始人：https://github.com/CortexReach/memory-lancedb-pro",
+          },
+        ],
+      },
+      { agentId: "life", sessionKey: "agent:life:test" },
+    );
+
+    const freshStore = new MemoryStore({ dbPath, vectorDim: EMBEDDING_DIMENSIONS });
+    const entries = await freshStore.list(["agent:life"], undefined, 10, 0);
+    return { entries, logs };
+  } finally {
+    delete process.env.TEST_EMBEDDING_BASE_URL;
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+const sameTurnMultiCoverageResult =
+  await runSameTurnMultiMemoryStoreCoverageScenario();
+assert.equal(sameTurnMultiCoverageResult.entries.length, 2);
+assert.ok(
+  sameTurnMultiCoverageResult.entries.some((entry) =>
+    entry.text === "User (Master) uses OpenClaw daily; common AI coding tools: Claude Code and Codex."
+  ),
+);
+assert.ok(
+  sameTurnMultiCoverageResult.entries.some((entry) =>
+    entry.text === "User (Master) is the founder of the memory-lancedb-pro project: https://github.com/CortexReach/memory-lancedb-pro"
+  ),
+);
+assert.ok(
+  sameTurnMultiCoverageResult.entries.every((entry) =>
+    !entry.text.includes("请记住，我每天都用OpenClaw")
+  ),
+);
+assert.ok(
+  sameTurnMultiCoverageResult.logs.some((entry) =>
+    entry[1].includes("regex fallback skipped same-turn memory_store duplicate")
+  ),
+);
+assert.ok(
+  sameTurnMultiCoverageResult.logs.every((entry) =>
+    !entry[1].includes("auto-captured 1 memories")
+  ),
+);
+
+function createUnrelatedSameSessionEmbeddingServer() {
+  const makeVector = (...values) => {
+    const vector = new Array(EMBEDDING_DIMENSIONS).fill(0);
+    for (let i = 0; i < values.length; i += 1) {
+      vector[i] = values[i];
+    }
+    return vector;
+  };
+
+  const unrelatedToolVector = makeVector(1, 0, 0);
+  const explicitRememberVector = makeVector(0, 1, 0);
+  const defaultVector = makeVector(0, 0, 1);
+
+  return http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/v1/embeddings") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const inputs = Array.isArray(payload.input) ? payload.input : [payload.input];
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      object: "list",
+      data: inputs.map((input, index) => {
+        const text = String(input);
+        let embedding = defaultVector;
+        if (text === "User prefers dark mode.") {
+          embedding = unrelatedToolVector;
+        } else if (text.includes("请记住，我是火锅项目的创始人")) {
+          embedding = explicitRememberVector;
+        }
+        return {
+          object: "embedding",
+          index,
+          embedding,
+        };
+      }),
+      model: payload.model || "mock-embedding-model",
+      usage: {
+        prompt_tokens: 0,
+        total_tokens: 0,
+      },
+    }));
+  });
+}
+
+async function runUnrelatedSameSessionMemoryStoreScenario() {
+  const workDir = mkdtempSync(path.join(tmpdir(), "memory-smart-tool-unrelated-"));
+  const dbPath = path.join(workDir, "db");
+  const logs = [];
+  const embeddingServer = createUnrelatedSameSessionEmbeddingServer();
+
+  const server = http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/chat/completions") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const prompt = payload.messages?.[1]?.content || "";
+    const content = prompt.includes("Analyze the following session context")
+      ? JSON.stringify({ memories: [] })
+      : JSON.stringify({ memories: [] });
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: "chatcmpl-test",
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: "mock-memory-model",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content },
+          finish_reason: "stop",
+        },
+      ],
+    }));
+  });
+
+  await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const embeddingPort = embeddingServer.address().port;
+  const port = server.address().port;
+  process.env.TEST_EMBEDDING_BASE_URL = `http://127.0.0.1:${embeddingPort}/v1`;
+
+  try {
+    const api = createMockApi(
+      dbPath,
+      `http://127.0.0.1:${embeddingPort}/v1`,
+      `http://127.0.0.1:${port}`,
+      logs,
+    );
+    plugin.register(api);
+
+    const memoryStoreTool = api.toolFactories.memory_store({
+      agentId: "life",
+      sessionKey: "agent:life:test",
+    });
+
+    const toolResult = await memoryStoreTool.execute(
+      "call-memory-store-unrelated",
+      {
+        text: "User prefers dark mode.",
+        importance: 0.8,
+        category: "preference",
+        scope: "agent:life",
+      },
+      undefined,
+      undefined,
+      { agentId: "life", sessionKey: "agent:life:test" },
+    );
+
+    assert.equal(toolResult.details.action, "created");
+
+    await api.hooks.agent_end(
+      {
+        success: true,
+        sessionKey: "agent:life:test",
+        messages: [
+          {
+            role: "assistant",
+            content: "noop to advance turn and clear same-turn memory_store registry",
+          },
+        ],
+      },
+      { agentId: "life", sessionKey: "agent:life:test" },
+    );
+
+    await api.hooks.agent_end(
+      {
+        success: true,
+        sessionKey: "agent:life:test",
+        messages: [
+          {
+            role: "user",
+            content: "请记住，我是火锅项目的创始人：https://github.com/example/hotpot-project",
+          },
+        ],
+      },
+      { agentId: "life", sessionKey: "agent:life:test" },
+    );
+
+    const freshStore = new MemoryStore({ dbPath, vectorDim: EMBEDDING_DIMENSIONS });
+    const entries = await freshStore.list(["agent:life"], undefined, 10, 0);
+    return { entries, logs };
+  } finally {
+    delete process.env.TEST_EMBEDDING_BASE_URL;
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+const unrelatedSameSessionResult = await runUnrelatedSameSessionMemoryStoreScenario();
+assert.equal(unrelatedSameSessionResult.entries.length, 2);
+assert.ok(
+  unrelatedSameSessionResult.entries.some((entry) => entry.text === "User prefers dark mode."),
+);
+assert.ok(
+  unrelatedSameSessionResult.entries.some((entry) =>
+    entry.text === "请记住，我是火锅项目的创始人：https://github.com/example/hotpot-project"
+  ),
+);
+assert.ok(
+  unrelatedSameSessionResult.logs.some((entry) =>
+    entry[1].includes("auto-captured 1 memories")
+  ),
+);
+assert.ok(
+  unrelatedSameSessionResult.logs.every((entry) =>
+    !entry[1].includes("regex fallback skipped same-turn memory_store duplicate")
+  ),
+);
+
 async function runMultiRoundScenario() {
   const workDir = mkdtempSync(path.join(tmpdir(), "memory-smart-rounds-"));
   const dbPath = path.join(workDir, "db");

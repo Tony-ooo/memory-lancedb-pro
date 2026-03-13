@@ -1928,6 +1928,7 @@ const memoryLanceDBProPlugin = {
     const autoCaptureSeenTextCount = new Map<string, number>();
     const autoCapturePendingIngressTexts = new Map<string, string[]>();
     const autoCaptureRecentTexts = new Map<string, string[]>();
+    const autoCaptureSameTurnMemoryStoreWrites = new Map<string, number>();
 
     // Wire up the module-level debug logger for pure helper functions.
     _autoCaptureDebugLog = (msg: string) => api.logger.debug(msg);
@@ -1989,6 +1990,14 @@ const memoryLanceDBProPlugin = {
         agentId: undefined, // Will be determined at runtime from context
         workspaceDir: getDefaultWorkspaceDir(),
         mdMirror,
+        onMemoryStoreWrite: ({ sessionKey }) => {
+          if (!sessionKey || sessionKey === "unknown") return;
+          autoCaptureSameTurnMemoryStoreWrites.set(
+            sessionKey,
+            (autoCaptureSameTurnMemoryStoreWrites.get(sessionKey) ?? 0) + 1,
+          );
+          pruneMapIfOver(autoCaptureSameTurnMemoryStoreWrites, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+        },
       },
       {
         enableManagementTools: config.enableManagementTools,
@@ -2140,12 +2149,15 @@ const memoryLanceDBProPlugin = {
           return;
         }
 
+        const sessionKey = ctx?.sessionKey || (event as any).sessionKey || "unknown";
+        const sameTurnMemoryStoreWriteCount =
+          autoCaptureSameTurnMemoryStoreWrites.get(sessionKey) ?? 0;
+
         try {
           // Determine agent ID and default scope
-          const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+          const agentId = resolveHookAgentId(ctx?.agentId, sessionKey);
           const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
           const defaultScope = scopeManager.getDefaultScope(agentId);
-          const sessionKey = ctx?.sessionKey || (event as any).sessionKey || "unknown";
 
           api.logger.debug(
             `memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`,
@@ -2340,6 +2352,16 @@ const memoryLanceDBProPlugin = {
           // Store each capturable piece (limit to 3 per conversation)
           let stored = 0;
           for (const text of toCapture.slice(0, 3)) {
+            if (
+              sameTurnMemoryStoreWriteCount > 0 &&
+              hasExplicitRememberInstruction(text)
+            ) {
+              api.logger.info(
+                `memory-lancedb-pro: regex fallback skipped same-turn memory_store duplicate for agent ${agentId} (write-count=${sameTurnMemoryStoreWriteCount})`,
+              );
+              continue;
+            }
+
             const category = detectCategory(text);
             const vector = await embedder.embedPassage(text);
 
@@ -2347,9 +2369,7 @@ const memoryLanceDBProPlugin = {
             // Fail-open by design: dedup should not block auto-capture writes.
             let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
             try {
-              existing = await store.vectorSearch(vector, 1, 0.1, [
-                defaultScope,
-              ]);
+              existing = await store.vectorSearch(vector, 8, 0.1, accessibleScopes);
             } catch (err) {
               api.logger.warn(
                 `memory-lancedb-pro: auto-capture duplicate pre-check failed, continue store: ${String(err)}`,
@@ -2377,7 +2397,7 @@ const memoryLanceDBProPlugin = {
                     l0_abstract: text,
                     l1_overview: `- ${text}`,
                     l2_content: text,
-                    source_session: (event as any).sessionKey || "unknown",
+                    source_session: sessionKey,
                   },
                 ),
               ),
@@ -2400,6 +2420,10 @@ const memoryLanceDBProPlugin = {
           }
         } catch (err) {
           api.logger.warn(`memory-lancedb-pro: capture failed: ${String(err)}`);
+        } finally {
+          if (sessionKey !== "unknown") {
+            autoCaptureSameTurnMemoryStoreWrites.delete(sessionKey);
+          }
         }
       });
     }
