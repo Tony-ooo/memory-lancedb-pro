@@ -1119,6 +1119,238 @@ assert.ok(
   ),
 );
 
+async function runSameTurnSourceTextSuppressionScenario() {
+  const workDir = mkdtempSync(path.join(tmpdir(), "memory-smart-tool-source-text-"));
+  const dbPath = path.join(workDir, "db");
+  const logs = [];
+  const embeddingServer = createEmbeddingServer();
+
+  const server = http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/chat/completions") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: "chatcmpl-test",
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: "mock-memory-model",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: JSON.stringify({ memories: [] }) },
+          finish_reason: "stop",
+        },
+      ],
+    }));
+  });
+
+  await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const embeddingPort = embeddingServer.address().port;
+  const port = server.address().port;
+  process.env.TEST_EMBEDDING_BASE_URL = `http://127.0.0.1:${embeddingPort}/v1`;
+
+  try {
+    const api = createMockApi(
+      dbPath,
+      `http://127.0.0.1:${embeddingPort}/v1`,
+      `http://127.0.0.1:${port}`,
+      logs,
+    );
+    plugin.register(api);
+
+    const sessionKey = "agent:life:telegram:direct:test";
+    const userText = "我平时办公更喜欢MacBook，不喜欢使用iPad和手机";
+
+    api.hooks.message_received(
+      {
+        content: userText,
+        from: "user",
+      },
+      {
+        channelId: "telegram",
+        conversationId: "direct:test",
+        accountId: "acct-life",
+      },
+    );
+
+    const memoryStoreTool = api.toolFactories.memory_store({
+      agentId: "life",
+      sessionKey,
+    });
+
+    const toolResult = await memoryStoreTool.execute(
+      "call-memory-store-source-text",
+      {
+        text: "Preference: Master prefers doing office work on a MacBook, and dislikes using iPad or phone for typical work tasks.",
+        importance: 0.75,
+        category: "preference",
+        scope: "agent:life",
+      },
+      undefined,
+      undefined,
+      { agentId: "life", sessionKey },
+    );
+
+    assert.equal(toolResult.details.action, "created");
+
+    await api.hooks.agent_end(
+      {
+        success: true,
+        sessionKey,
+        messages: [
+          {
+            role: "user",
+            content: userText,
+          },
+        ],
+      },
+      { agentId: "life", sessionKey },
+    );
+
+    const freshStore = new MemoryStore({ dbPath, vectorDim: EMBEDDING_DIMENSIONS });
+    const entries = await freshStore.list(["agent:life"], undefined, 10, 0);
+    return { entries, logs };
+  } finally {
+    delete process.env.TEST_EMBEDDING_BASE_URL;
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+const sameTurnSourceTextSuppressionResult =
+  await runSameTurnSourceTextSuppressionScenario();
+assert.equal(sameTurnSourceTextSuppressionResult.entries.length, 1);
+assert.equal(
+  sameTurnSourceTextSuppressionResult.entries[0].text,
+  "Preference: Master prefers doing office work on a MacBook, and dislikes using iPad or phone for typical work tasks.",
+);
+assert.ok(
+  sameTurnSourceTextSuppressionResult.logs.some((entry) =>
+    entry[1].includes("regex fallback skipped same-turn memory_store duplicate for agent life (reason=source-text-match")
+  ),
+);
+assert.ok(
+  sameTurnSourceTextSuppressionResult.logs.every((entry) =>
+    !entry[1].includes("auto-captured 1 memories")
+  ),
+);
+
+async function runSameTurnSingleTextFallbackSuppressionScenario() {
+  const workDir = mkdtempSync(path.join(tmpdir(), "memory-smart-tool-single-text-"));
+  const dbPath = path.join(workDir, "db");
+  const logs = [];
+  const embeddingServer = createEmbeddingServer();
+
+  const server = http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/chat/completions") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: "chatcmpl-test",
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: "mock-memory-model",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: JSON.stringify({ memories: [] }) },
+          finish_reason: "stop",
+        },
+      ],
+    }));
+  });
+
+  await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const embeddingPort = embeddingServer.address().port;
+  const port = server.address().port;
+  process.env.TEST_EMBEDDING_BASE_URL = `http://127.0.0.1:${embeddingPort}/v1`;
+
+  try {
+    const api = createMockApi(
+      dbPath,
+      `http://127.0.0.1:${embeddingPort}/v1`,
+      `http://127.0.0.1:${port}`,
+      logs,
+    );
+    plugin.register(api);
+
+    const sessionKey = "agent:life:telegram:direct:test";
+    const userText = "我喜欢甜食和咖啡，偶尔喝茶";
+
+    const memoryStoreTool = api.toolFactories.memory_store({
+      agentId: "life",
+      sessionKey,
+    });
+
+    const toolResult = await memoryStoreTool.execute(
+      "call-memory-store-single-text",
+      {
+        text: "User preference: likes sweets and coffee; occasionally drinks tea.",
+        importance: 0.75,
+        category: "preference",
+        scope: "agent:life",
+      },
+      undefined,
+      undefined,
+      { agentId: "life", sessionKey },
+    );
+
+    assert.equal(toolResult.details.action, "created");
+
+    await api.hooks.agent_end(
+      {
+        success: true,
+        sessionKey,
+        messages: [
+          {
+            role: "user",
+            content: userText,
+          },
+        ],
+      },
+      { agentId: "life", sessionKey },
+    );
+
+    const freshStore = new MemoryStore({ dbPath, vectorDim: EMBEDDING_DIMENSIONS });
+    const entries = await freshStore.list(["agent:life"], undefined, 10, 0);
+    return { entries, logs };
+  } finally {
+    delete process.env.TEST_EMBEDDING_BASE_URL;
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+const sameTurnSingleTextFallbackResult =
+  await runSameTurnSingleTextFallbackSuppressionScenario();
+assert.equal(sameTurnSingleTextFallbackResult.entries.length, 1);
+assert.equal(
+  sameTurnSingleTextFallbackResult.entries[0].text,
+  "User preference: likes sweets and coffee; occasionally drinks tea.",
+);
+assert.ok(
+  sameTurnSingleTextFallbackResult.logs.some((entry) =>
+    entry[1].includes("regex fallback skipped same-turn memory_store duplicate for agent life (reason=single-current-text")
+  ),
+);
+assert.ok(
+  sameTurnSingleTextFallbackResult.logs.every((entry) =>
+    !entry[1].includes("auto-captured 1 memories")
+  ),
+);
+
 async function runMultiRoundScenario() {
   const workDir = mkdtempSync(path.join(tmpdir(), "memory-smart-rounds-"));
   const dbPath = path.join(workDir, "db");

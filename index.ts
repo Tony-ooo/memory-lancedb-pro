@@ -731,6 +731,18 @@ function pruneMapIfOver<K, V>(map: Map<K, V>, maxEntries: number): void {
   }
 }
 
+function mergeAutoCaptureSourceTexts(existing: string[], incoming: string[]): string[] {
+  const seen = new Set(existing);
+  const merged = [...existing];
+  for (const text of incoming) {
+    const normalized = text.trim();
+    if (!normalized || seen.has(normalized)) continue;
+    merged.push(normalized);
+    seen.add(normalized);
+  }
+  return merged.slice(-6);
+}
+
 function stripAutoCaptureSessionResetPrefix(text: string): string {
   const trimmed = text.trim();
   if (!trimmed.startsWith(AUTO_CAPTURE_SESSION_RESET_PREFIX)) {
@@ -1928,7 +1940,10 @@ const memoryLanceDBProPlugin = {
     const autoCaptureSeenTextCount = new Map<string, number>();
     const autoCapturePendingIngressTexts = new Map<string, string[]>();
     const autoCaptureRecentTexts = new Map<string, string[]>();
-    const autoCaptureSameTurnMemoryStoreWrites = new Map<string, number>();
+    const autoCaptureSameTurnMemoryStoreWrites = new Map<
+      string,
+      { count: number; sourceTexts: string[] }
+    >();
 
     // Wire up the module-level debug logger for pure helper functions.
     _autoCaptureDebugLog = (msg: string) => api.logger.debug(msg);
@@ -1992,9 +2007,20 @@ const memoryLanceDBProPlugin = {
         mdMirror,
         onMemoryStoreWrite: ({ sessionKey }) => {
           if (!sessionKey || sessionKey === "unknown") return;
+          const conversationKey = buildAutoCaptureConversationKeyFromSessionKey(sessionKey);
+          const pendingSourceTexts = conversationKey
+            ? autoCapturePendingIngressTexts.get(conversationKey) || []
+            : [];
+          const previousState = autoCaptureSameTurnMemoryStoreWrites.get(sessionKey) || {
+            count: 0,
+            sourceTexts: [],
+          };
           autoCaptureSameTurnMemoryStoreWrites.set(
             sessionKey,
-            (autoCaptureSameTurnMemoryStoreWrites.get(sessionKey) ?? 0) + 1,
+            {
+              count: previousState.count + 1,
+              sourceTexts: mergeAutoCaptureSourceTexts(previousState.sourceTexts, pendingSourceTexts),
+            },
           );
           pruneMapIfOver(autoCaptureSameTurnMemoryStoreWrites, AUTO_CAPTURE_MAP_MAX_ENTRIES);
         },
@@ -2150,8 +2176,11 @@ const memoryLanceDBProPlugin = {
         }
 
         const sessionKey = ctx?.sessionKey || (event as any).sessionKey || "unknown";
-        const sameTurnMemoryStoreWriteCount =
-          autoCaptureSameTurnMemoryStoreWrites.get(sessionKey) ?? 0;
+        const sameTurnMemoryStoreState =
+          autoCaptureSameTurnMemoryStoreWrites.get(sessionKey) || {
+            count: 0,
+            sourceTexts: [],
+          };
 
         try {
           // Determine agent ID and default scope
@@ -2349,15 +2378,30 @@ const memoryLanceDBProPlugin = {
             `memory-lancedb-pro: regex fallback found ${toCapture.length} capturable text(s) for agent ${agentId}`,
           );
 
+          const shouldSuppressSingleCurrentTextFallback =
+            sameTurnMemoryStoreState.count > 0 &&
+            sameTurnMemoryStoreState.sourceTexts.length === 0 &&
+            texts.length === 1 &&
+            toCapture.length === 1;
+
           // Store each capturable piece (limit to 3 per conversation)
           let stored = 0;
           for (const text of toCapture.slice(0, 3)) {
             if (
-              sameTurnMemoryStoreWriteCount > 0 &&
-              hasExplicitRememberInstruction(text)
+              sameTurnMemoryStoreState.count > 0 &&
+              (
+                sameTurnMemoryStoreState.sourceTexts.includes(text) ||
+                hasExplicitRememberInstruction(text) ||
+                shouldSuppressSingleCurrentTextFallback
+              )
             ) {
+              const suppressionReason = sameTurnMemoryStoreState.sourceTexts.includes(text)
+                ? "source-text-match"
+                : hasExplicitRememberInstruction(text)
+                  ? "explicit-remember"
+                  : "single-current-text";
               api.logger.info(
-                `memory-lancedb-pro: regex fallback skipped same-turn memory_store duplicate for agent ${agentId} (write-count=${sameTurnMemoryStoreWriteCount})`,
+                `memory-lancedb-pro: regex fallback skipped same-turn memory_store duplicate for agent ${agentId} (reason=${suppressionReason}, write-count=${sameTurnMemoryStoreState.count})`,
               );
               continue;
             }
