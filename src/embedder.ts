@@ -352,6 +352,22 @@ export function formatEmbeddingProviderError(
   return `${genericPrefix}${detailText}`;
 }
 
+// ============================================================================
+// Safety Constants
+// ============================================================================
+
+/** Maximum recursion depth for embedSingle chunking retries. */
+const MAX_EMBED_DEPTH = 3;
+
+/** Global timeout for a single embedding operation (ms). */
+const EMBED_TIMEOUT_MS = 10_000;
+
+/**
+ * Strictly decreasing character limit for forced truncation.
+ * Each recursion level MUST reduce input by this factor to guarantee progress.
+ */
+const STRICT_REDUCTION_FACTOR = 0.5; // Each retry must be at most 50% of previous
+
 export function getVectorDimensions(model: string, overrideDims?: number): number {
   if (overrideDims && overrideDims > 0) {
     return overrideDims;
@@ -472,16 +488,23 @@ export class Embedder {
   /**
    * Call embeddings.create with automatic key rotation on rate-limit errors.
    * Tries each key in the pool at most once before giving up.
+   * Accepts an optional AbortSignal to support true request cancellation.
    */
-  private async embedWithRetry(payload: any): Promise<any> {
+  private async embedWithRetry(payload: any, signal?: AbortSignal): Promise<any> {
     const maxAttempts = this.clients.length;
     let lastError: Error | undefined;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const client = this.nextClient();
       try {
-        return await client.embeddings.create(payload);
+        // Pass signal to OpenAI SDK if provided (SDK v6+ supports this)
+        return await client.embeddings.create(payload, signal ? { signal } : undefined);
       } catch (error) {
+        // If aborted, re-throw immediately
+        if (error instanceof Error && error.name === 'AbortError') {
+          throw error;
+        }
+        
         lastError = error instanceof Error ? error : new Error(String(error));
 
         if (this.isRateLimitError(error) && attempt < maxAttempts - 1) {
@@ -510,6 +533,13 @@ export class Embedder {
     return this.clients.length;
   }
 
+  /** Wrap a single embedding operation with a global timeout via AbortSignal. */
+  private withTimeout<T>(promiseFactory: (signal: AbortSignal) => Promise<T>, _label: string): Promise<T> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), EMBED_TIMEOUT_MS);
+    return promiseFactory(controller.signal).finally(() => clearTimeout(timeoutId));
+  }
+
   // --------------------------------------------------------------------------
   // Backward-compatible API
   // --------------------------------------------------------------------------
@@ -534,13 +564,17 @@ export class Embedder {
   // --------------------------------------------------------------------------
 
   async embedQuery(text: string): Promise<number[]> {
-    return this.embedSingle(text, this._taskQuery);
+    return this.withTimeout((signal) => this.embedSingle(text, this._taskQuery, 0, signal), "embedQuery");
   }
 
   async embedPassage(text: string): Promise<number[]> {
-    return this.embedSingle(text, this._taskPassage);
+    return this.withTimeout((signal) => this.embedSingle(text, this._taskPassage, 0, signal), "embedPassage");
   }
 
+  // Note: embedBatchQuery/embedBatchPassage are NOT wrapped with withTimeout because
+  // they handle multiple texts in a single API call. The timeout would fire after
+  // EMBED_TIMEOUT_MS regardless of how many texts succeed. Individual text embedding
+  // within the batch is protected by the SDK's own timeout handling.
   async embedBatchQuery(texts: string[]): Promise<number[][]> {
     return this.embedMany(texts, this._taskQuery);
   }
@@ -595,9 +629,24 @@ export class Embedder {
     return payload;
   }
 
-  private async embedSingle(text: string, task?: string): Promise<number[]> {
+  private async embedSingle(text: string, task?: string, depth: number = 0, signal?: AbortSignal): Promise<number[]> {
     if (!text || text.trim().length === 0) {
       throw new Error("Cannot embed empty text");
+    }
+
+    // FR-01: Recursion depth limit — force truncate when too deep
+    if (depth >= MAX_EMBED_DEPTH) {
+      const safeLimit = Math.floor(text.length * STRICT_REDUCTION_FACTOR);
+      console.warn(
+        `[memory-lancedb-pro] Recursion depth ${depth} reached MAX_EMBED_DEPTH (${MAX_EMBED_DEPTH}), ` +
+        `force-truncating ${text.length} chars → ${safeLimit} chars (strict ${STRICT_REDUCTION_FACTOR * 100}% reduction)`
+      );
+      if (safeLimit < 100) {
+        throw new Error(
+          `[memory-lancedb-pro] Failed to embed: input too large for model context after ${MAX_EMBED_DEPTH} retries`
+        );
+      }
+      text = text.slice(0, safeLimit);
     }
 
     // Check cache first
@@ -605,7 +654,7 @@ export class Embedder {
     if (cached) return cached;
 
     try {
-      const response = await this.embedWithRetry(this.buildPayload(text, task));
+      const response = await this.embedWithRetry(this.buildPayload(text, task), signal);
       const embedding = response.data[0]?.embedding as number[] | undefined;
       if (!embedding) {
         throw new Error("No embedding returned from provider");
@@ -628,12 +677,35 @@ export class Embedder {
             throw new Error(`Failed to chunk document: ${errorMsg}`);
           }
 
+          // FR-03: Single chunk output detection — if smartChunk produced only
+          // one chunk that is nearly the same size as the original text, chunking
+          // did not actually reduce the problem. Force-truncate with STRICT
+          // reduction to guarantee progress.
+          if (
+            chunkResult.chunks.length === 1 &&
+            chunkResult.chunks[0].length > text.length * 0.9
+          ) {
+            // Use strict reduction factor to guarantee each retry makes progress
+            const safeLimit = Math.floor(text.length * STRICT_REDUCTION_FACTOR);
+            console.warn(
+              `[memory-lancedb-pro] smartChunk produced 1 chunk (${chunkResult.chunks[0].length} chars) ≈ original (${text.length} chars). ` +
+              `Force-truncating to ${safeLimit} chars (strict ${STRICT_REDUCTION_FACTOR * 100}% reduction) to avoid infinite recursion.`
+            );
+            if (safeLimit < 100) {
+              throw new Error(
+                `[memory-lancedb-pro] Failed to embed: chunking couldn't reduce input size enough for model context`
+              );
+            }
+            const truncated = text.slice(0, safeLimit);
+            return this.embedSingle(truncated, task, depth + 1, signal);
+          }
+
           // Embed all chunks in parallel
           console.log(`Split document into ${chunkResult.chunkCount} chunks for embedding`);
           const chunkEmbeddings = await Promise.all(
             chunkResult.chunks.map(async (chunk, idx) => {
               try {
-                const embedding = await this.embedSingle(chunk, task);
+                const embedding = await this.embedSingle(chunk, task, depth + 1, signal);
                 return { embedding };
               } catch (chunkError) {
                 console.warn(`Failed to embed chunk ${idx}:`, chunkError);
@@ -661,14 +733,9 @@ export class Embedder {
 
           return finalEmbedding;
         } catch (chunkError) {
-          // If chunking fails, throw the original error
-          console.warn(`Chunking failed, using original error:`, chunkError);
-          const friendly = formatEmbeddingProviderError(error, {
-            baseURL: this._baseURL,
-            model: this._model,
-            mode: "single",
-          });
-          throw new Error(friendly, { cause: error });
+          // Preserve and surface the more specific chunkError
+          console.warn(`Chunking failed:`, chunkError);
+          throw chunkError;
         }
       }
 
