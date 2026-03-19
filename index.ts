@@ -2076,6 +2076,7 @@ const memoryLanceDBProPlugin = {
     // Auto-recall: inject relevant memories before agent starts
     // Default is OFF to prevent the model from accidentally echoing injected context.
     if (config.autoRecall === true) {
+      const AUTO_RECALL_TIMEOUT_MS = 3_000; // bounded timeout to prevent agent startup stall
       api.on("before_agent_start", async (event, ctx) => {
         if (
           !event.prompt ||
@@ -2089,7 +2090,13 @@ const memoryLanceDBProPlugin = {
         const currentTurn = (turnCounter.get(sessionId) || 0) + 1;
         turnCounter.set(sessionId, currentTurn);
 
-        try {
+        // Wrap the entire recall pipeline in a timeout so slow embedding/rerank
+        // API calls cannot stall agent startup indefinitely.  Without this guard
+        // the session lock is held for the full duration of the retrieval chain
+        // (embedding → rerank → lifecycle), which can silently drop messages on
+        // channels like Telegram when subsequent requests hit lock timeouts.
+        // See: https://github.com/CortexReach/memory-lancedb-pro/issues/253
+        const recallWork = async (): Promise<{ prependContext: string } | undefined> => {
           // Determine agent ID and accessible scopes
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
@@ -2180,6 +2187,21 @@ const memoryLanceDBProPlugin = {
               `[END UNTRUSTED DATA]\n` +
               `</relevant-memories>`,
           };
+        };
+
+        try {
+          const result = await Promise.race([
+            recallWork(),
+            new Promise<undefined>((resolve) =>
+              setTimeout(() => {
+                api.logger.warn(
+                  `memory-lancedb-pro: auto-recall timed out after ${AUTO_RECALL_TIMEOUT_MS}ms; skipping memory injection to avoid stalling agent startup`,
+                );
+                resolve(undefined);
+              }, AUTO_RECALL_TIMEOUT_MS),
+            ),
+          ]);
+          return result;
         } catch (err) {
           api.logger.warn(`memory-lancedb-pro: recall failed: ${String(err)}`);
         }
