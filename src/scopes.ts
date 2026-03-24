@@ -220,8 +220,10 @@ export class MemoryScopeManager implements ScopeManager {
    * and `[]` only when they intend reads to match nothing.
    */
   getScopeFilter(agentId?: string): string[] | undefined {
-    if (isSystemBypassId(agentId)) {
-      // Internal system tasks bypass store-level scope filtering entirely.
+    if (!agentId || isSystemBypassId(agentId)) {
+      // No agent specified or internal system tasks bypass store-level scope
+      // filtering entirely.  This aligns with isAccessible(scope, undefined)
+      // which also uses bypass semantics for missing agentId.
       return undefined;
     }
     return this.getAccessibleScopes(agentId);

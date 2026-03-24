@@ -1069,7 +1069,7 @@ export function registerMemoryUpdateTool(
 
           // Determine accessible scopes
           const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
-          const scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
+          const scopeFilter = resolveScopeFilter(runtimeContext.scopeManager, agentId);
 
           // Resolve memoryId: if it doesn't look like a UUID, try search
           let resolvedId = memoryId;

@@ -62,9 +62,9 @@ describe("MemoryScopeManager - System & Reflection Scopes", () => {
       ]);
     });
 
-    it("does not bypass the store filter for empty or nullish agentId", () => {
-      assert.deepStrictEqual(manager.getScopeFilter(""), manager.getAllScopes());
-      assert.deepStrictEqual(manager.getScopeFilter(undefined), manager.getAllScopes());
+    it("bypasses the store filter for empty or nullish agentId (consistent with isAccessible)", () => {
+      assert.strictEqual(manager.getScopeFilter(""), undefined);
+      assert.strictEqual(manager.getScopeFilter(undefined), undefined);
     });
 
     it("rejects whitespace-padded reserved bypass ids extracted from session keys", () => {
