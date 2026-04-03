@@ -70,14 +70,14 @@ import { batchDedup } from "./batch-dedup.js";
  * - Standalone JSON blocks containing message_id/sender_id fields
  */
 export function stripEnvelopeMetadata(text: string): string {
-  // 0. Strip runtime orchestration wrappers that should never become memories
-  //    (sub-agent task scaffolding is execution metadata, not conversation content).
+  // 0. Strip runtime orchestration wrappers that should never become memories.
+  // These are execution hints for subagents, not conversation content.
   let cleaned = text.replace(
-    /^\[(?:Subagent Context|Subagent Task)\]\s*(?:You are running as a subagent.*?(?:$|(?<=\.)\s+)|Results auto-announce to your requester\.?\s*|do not busy-poll for status\.?\s*|Reply with a brief acknowledgment only\.?\s*|Do not use any memory tools\.?\s*)?/gim,
+    /^\[(?:Subagent Context|Subagent Task)\].*$/gim,
     "",
   );
   cleaned = cleaned.replace(
-    /^(?:Results auto-announce to your requester\.?|do not busy-poll for status\.?|Do not use any memory tools\.?)\s*$/gim,
+    /^(?:You are running as a subagent\b.*|Results auto-announce to your requester\.?|do not busy-poll for status\.?|Reply with a brief acknowledgment only\.?|Do not use any memory tools\.?)\s*$/gim,
     "",
   );
 
