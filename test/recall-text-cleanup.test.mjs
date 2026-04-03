@@ -25,7 +25,11 @@ const origCreateEmbedder = embedderModuleForMock.createEmbedder;
 
 const pluginModule = jiti("../index.ts");
 const memoryLanceDBProPlugin = pluginModule.default || pluginModule;
-const { registerMemoryRecallTool, registerMemoryStoreTool } = jiti("../src/tools.ts");
+const {
+  registerMemoryListTool,
+  registerMemoryRecallTool,
+  registerMemoryStoreTool,
+} = jiti("../src/tools.ts");
 const { MemoryRetriever } = jiti("../src/retriever.js");
 const { buildSmartMetadata, stringifySmartMetadata } = jiti("../src/smart-metadata.ts");
 
@@ -107,6 +111,50 @@ function makeResults() {
       },
     },
   ];
+}
+
+function makeSessionSummaryEntry({
+  id = "ss1",
+  text = "Session: 2026-04-03 12:00:00 UTC\nConversation Summary:\nuser: discussed OAuth endpoint",
+  scope = "global",
+  timestamp = Date.now(),
+} = {}) {
+  return {
+    id,
+    text,
+    category: "fact",
+    scope,
+    importance: 0.5,
+    timestamp,
+    metadata: stringifySmartMetadata(
+      buildSmartMetadata(
+        { text: "Session summary for 2026-04-03", category: "fact", importance: 0.5, timestamp },
+        {
+          l0_abstract: "Session summary for 2026-04-03",
+          l1_overview: "- Session summary saved for session-42",
+          l2_content: text,
+          memory_category: "patterns",
+          tier: "peripheral",
+          confidence: 0.5,
+          type: "session-summary",
+          sessionKey: "agent:main:telegram:group:-100123:topic:42",
+          sessionId: "session-42",
+          scope,
+        },
+      ),
+    ),
+  };
+}
+
+function makeSessionSummaryResult(overrides = {}) {
+  return {
+    entry: makeSessionSummaryEntry(overrides.entry),
+    score: 0.99,
+    sources: {
+      vector: { score: 0.99, rank: 1 },
+    },
+    ...overrides,
+  };
 }
 
 function makeExpandedResults() {
@@ -436,6 +484,28 @@ describe("recall text cleanup", () => {
     assert.doesNotMatch(output.prependContext, /\d+%/);
   });
 
+  it("filters session-summary rows from memory_recall output and patch updates", async () => {
+    const patchedIds = [];
+    const tool = createTool(registerMemoryRecallTool, {
+      ...makeRecallContext([makeSessionSummaryResult(), ...makeResults()]),
+      store: {
+        patchMetadata: async (id) => {
+          patchedIds.push(id);
+          return null;
+        },
+      },
+    });
+    const res = await tool.execute(null, { query: "recent session summary leak", limit: 3 });
+
+    assert.deepEqual(extractRenderedMemoryRecallLines(res.content[0].text), [
+      "1. [m1] [fact:global] remember this",
+      "2. [m2] [preference:global] prefer concise diffs",
+    ]);
+    assert.equal(res.details.memories.length, 2);
+    assert.deepEqual(patchedIds, ["m1", "m2"]);
+    assert.doesNotMatch(res.content[0].text, /Session summary for 2026-04-03/);
+  });
+
   it("defaults memory_recall to concise output (limit=3, preview text)", async () => {
     const tool = createTool(registerMemoryRecallTool, makeRecallContext(makeManyResults(7)));
     const res = await tool.execute(null, { query: "many memories" });
@@ -724,6 +794,55 @@ describe("recall text cleanup", () => {
     assert.doesNotMatch(res.content[0].text, /称呼偏好：宙斯/);
   });
 
+  it("filters session-summary rows from memory_list without consuming visible offsets", async () => {
+    const listedEntries = [
+      makeSessionSummaryEntry({ id: "ss-top", timestamp: 5_000 }),
+      {
+        id: "n1",
+        text: "visible memory 1",
+        category: "fact",
+        scope: "global",
+        importance: 0.7,
+        timestamp: 4_000,
+        metadata: "{}",
+      },
+      makeSessionSummaryEntry({ id: "ss-middle", timestamp: 3_000 }),
+      {
+        id: "n2",
+        text: "visible memory 2",
+        category: "fact",
+        scope: "global",
+        importance: 0.7,
+        timestamp: 2_000,
+        metadata: "{}",
+      },
+      {
+        id: "n3",
+        text: "visible memory 3",
+        category: "fact",
+        scope: "global",
+        importance: 0.7,
+        timestamp: 1_000,
+        metadata: "{}",
+      },
+    ];
+    const tool = createTool(registerMemoryListTool, {
+      ...makeRecallContext(),
+      store: {
+        async list(_scopeFilter, _category, limit = 20, offset = 0) {
+          return listedEntries.slice(offset, offset + limit);
+        },
+      },
+    });
+    const res = await tool.execute(null, { limit: 2, offset: 1 });
+    const lines = extractRenderedMemoryRecallLines(res.content[0].text);
+
+    assert.equal(lines.length, 2);
+    assert.match(lines[0], /\[n2\].*visible memory 2/);
+    assert.match(lines[1], /\[n3\].*visible memory 3/);
+    assert.doesNotMatch(res.content[0].text, /Session: 2026-04-03 12:00:00 UTC/);
+  });
+
   it("skips USER.md-exclusive facts in memory_store", async () => {
     const tool = createTool(registerMemoryStoreTool, {
       ...makeRecallContext(),
@@ -925,4 +1044,3 @@ describe("recall text cleanup", () => {
     assert.match(res.content[0].text, /称呼偏好：宙斯/);
   });
 });
-

@@ -9,7 +9,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { MemoryRetriever, RetrievalResult } from "./retriever.js";
-import type { MemoryStore } from "./store.js";
+import type { MemoryEntry, MemoryStore } from "./store.js";
 import { isNoise } from "./noise-filter.js";
 import { isSystemBypassId, resolveScopeFilter, parseAgentIdFromSessionKey, type MemoryScopeManager } from "./scopes.js";
 import type { Embedder } from "./embedder.js";
@@ -100,6 +100,38 @@ function deriveManualMemoryLayer(category: string): "durable" | "working" {
     return "durable";
   }
   return "working";
+}
+
+function isSessionSummaryEntry(entry: MemoryEntry): boolean {
+  return parseSmartMetadata(entry.metadata, entry).type === "session-summary";
+}
+
+function filterSessionSummaryResults(results: RetrievalResult[]): RetrievalResult[] {
+  return results.filter((result) => !isSessionSummaryEntry(result.entry));
+}
+
+async function listVisibleEntries(
+  store: MemoryStore,
+  scopeFilter: string[] | undefined,
+  category: string | undefined,
+  limit: number,
+  offset: number,
+): Promise<MemoryEntry[]> {
+  const targetCount = offset + limit;
+  const visibleEntries: MemoryEntry[] = [];
+  let rawOffset = 0;
+  const batchSize = Math.max(50, Math.min(200, targetCount || 50));
+
+  // Hidden session-summary rows should not consume user-facing pagination.
+  while (visibleEntries.length < targetCount) {
+    const batch = await store.list(scopeFilter, category, batchSize, rawOffset);
+    if (batch.length === 0) break;
+    visibleEntries.push(...batch.filter((entry) => !isSessionSummaryEntry(entry)));
+    rawOffset += batch.length;
+    if (batch.length < batchSize) break;
+  }
+
+  return visibleEntries.slice(offset, targetCount);
 }
 
 function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
@@ -567,13 +599,19 @@ export function registerMemoryRecallTool(
             }
           }
 
-          const results = filterUserMdExclusiveRecallResults(await retrieveWithRetry(runtimeContext.retriever, {
-            query,
-            limit: safeLimit,
-            scopeFilter,
-            category,
-            source: "manual",
-          }), runtimeContext.workspaceBoundary);
+          const requestedLimit = Math.min(
+            includeFullText ? 40 : 24,
+            Math.max(safeLimit * 4, safeLimit + 8),
+          );
+          const results = filterSessionSummaryResults(
+            filterUserMdExclusiveRecallResults(await retrieveWithRetry(runtimeContext.retriever, {
+              query,
+              limit: requestedLimit,
+              scopeFilter,
+              category,
+              source: "manual",
+            }), runtimeContext.workspaceBoundary),
+          ).slice(0, safeLimit);
 
           if (results.length === 0) {
             return {
@@ -1699,7 +1737,8 @@ export function registerMemoryListTool(
             }
           }
 
-          const entries = await context.store.list(
+          const entries = await listVisibleEntries(
+            context.store,
             scopeFilter,
             category,
             safeLimit,

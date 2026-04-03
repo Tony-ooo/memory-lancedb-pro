@@ -308,13 +308,6 @@ function resolveHookAgentId(
     : parseAgentIdFromSessionKey(sessionKey)) || "main";
 }
 
-function resolveSourceFromSessionKey(sessionKey: string | undefined): string {
-  const trimmed = sessionKey?.trim() ?? "";
-  const match = /^agent:[^:]+:([^:]+)/.exec(trimmed);
-  const source = match?.[1]?.trim();
-  return source || "unknown";
-}
-
 function summarizeAgentEndMessages(messages: unknown[]): string {
   const roleCounts = new Map<string, number>();
   let textBlocks = 0;
@@ -3578,110 +3571,16 @@ const memoryLanceDBProPlugin = {
     }
 
     if (config.sessionStrategy === "systemSessionMemory") {
-      const sessionMessageCount = config.sessionMemory?.messageCount ?? 15;
-
-      const storeSystemSessionSummary = async (params: {
-        agentId: string;
-        defaultScope: string;
-        sessionKey: string;
-        sessionId: string;
-        source: string;
-        sessionContent: string;
-        timestampMs?: number;
-      }) => {
-        const now = new Date(params.timestampMs ?? Date.now());
-        const dateStr = now.toISOString().split("T")[0];
-        const timeStr = now.toISOString().split("T")[1].split(".")[0];
-        const memoryText = [
-          `Session: ${dateStr} ${timeStr} UTC`,
-          `Session Key: ${params.sessionKey}`,
-          `Session ID: ${params.sessionId}`,
-          `Source: ${params.source}`,
-          "",
-          "Conversation Summary:",
-          params.sessionContent,
-        ].join("\n");
-
-        const vector = await embedder.embedPassage(memoryText);
-        await store.store({
-          text: memoryText,
-          vector,
-          category: "fact",
-          scope: params.defaultScope,
-          importance: 0.5,
-          metadata: stringifySmartMetadata(
-            buildSmartMetadata(
-              {
-                text: `Session summary for ${dateStr}`,
-                category: "fact",
-                importance: 0.5,
-                timestamp: Date.now(),
-              },
-              {
-                l0_abstract: `Session summary for ${dateStr}`,
-                l1_overview: `- Session summary saved for ${params.sessionId}`,
-                l2_content: memoryText,
-                memory_category: "patterns",
-                tier: "peripheral",
-                confidence: 0.5,
-                type: "session-summary",
-                sessionKey: params.sessionKey,
-                sessionId: params.sessionId,
-                date: dateStr,
-                agentId: params.agentId,
-                scope: params.defaultScope,
-              },
-            ),
-          ),
-        });
-
-        api.logger.info(
-          `session-memory: stored session summary for ${params.sessionId} (agent: ${params.agentId}, scope: ${params.defaultScope})`
-        );
-      };
-
-      api.on("before_reset", async (event, ctx) => {
+      api.on("before_reset", async (event) => {
         if (event.reason !== "new") return;
-
-        try {
-          const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
-          const agentId = resolveHookAgentId(
-            typeof ctx.agentId === "string" ? ctx.agentId : undefined,
-            sessionKey,
-          );
-          const defaultScope = isSystemBypassId(agentId)
-            ? config.scopes?.default ?? "global"
-            : scopeManager.getDefaultScope(agentId);
-          const currentSessionId =
-            typeof ctx.sessionId === "string" && ctx.sessionId.trim().length > 0
-              ? ctx.sessionId
-              : "unknown";
-          const source = resolveSourceFromSessionKey(sessionKey);
-          const sessionContent =
-            summarizeRecentConversationMessages(event.messages ?? [], sessionMessageCount) ??
-            (typeof event.sessionFile === "string"
-              ? await readSessionConversationWithResetFallback(event.sessionFile, sessionMessageCount)
-              : null);
-
-          if (!sessionContent) {
-            api.logger.debug("session-memory: no session content found, skipping");
-            return;
-          }
-
-          await storeSystemSessionSummary({
-            agentId,
-            defaultScope,
-            sessionKey,
-            sessionId: currentSessionId,
-            source,
-            sessionContent,
-          });
-        } catch (err) {
-          api.logger.warn(`session-memory: failed to save: ${String(err)}`);
-        }
+        api.logger.debug(
+          "session-memory: skipped LanceDB session-summary write; relying on host session memory instead",
+        );
       });
 
-      (isCliMode() ? api.logger.debug : api.logger.info)("session-memory: typed before_reset hook registered for /new session summaries");
+      (isCliMode() ? api.logger.debug : api.logger.info)(
+        "session-memory: compatibility before_reset hook registered; LanceDB session-summary writes disabled",
+      );
     }
     if (config.sessionStrategy === "none") {
       (isCliMode() ? api.logger.debug : api.logger.info)("session-strategy: using none (plugin memory-reflection hooks disabled)");

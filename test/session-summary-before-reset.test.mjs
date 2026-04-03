@@ -97,7 +97,7 @@ describe("systemSessionMemory before_reset", () => {
     rmSync(workDir, { recursive: true, force: true });
   });
 
-  it("stores a session-summary row for /new using before_reset messages", async () => {
+  it("does not store a session-summary row for /new using before_reset messages", async () => {
     const dbPath = path.join(workDir, "db");
     const api = createApiHarness({ dbPath, embeddingBaseURL });
 
@@ -125,17 +125,7 @@ describe("systemSessionMemory before_reset", () => {
 
     const store = new MemoryStore({ dbPath, vectorDim: EMBEDDING_DIMENSIONS });
     const entries = await store.list(undefined, undefined, 10, 0);
-    assert.equal(entries.length, 1);
-
-    const [entry] = entries;
-    const metadata = JSON.parse(entry.metadata || "{}");
-    assert.equal(metadata.type, "session-summary");
-    assert.equal(metadata.sessionId, "session-42");
-    assert.equal(metadata.sessionKey, "agent:main:telegram:group:-100123:topic:42");
-    assert.match(entry.text, /Source: telegram/);
-    assert.match(entry.text, /Conversation Summary:/);
-    assert.match(entry.text, /user: Need to fix the OAuth endpoint\./);
-    assert.match(entry.text, /assistant: Patched the endpoint and verified the login flow\./);
+    assert.equal(entries.length, 0);
   });
 
   it("skips writes for /reset", async () => {
