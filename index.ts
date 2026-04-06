@@ -3746,9 +3746,8 @@ const memoryLanceDBProPlugin = {
           }
         }, 5_000);
 
-        // Run initial backup after a short delay, then schedule daily
-        setTimeout(() => void runBackup(), 60_000); // 1 min after start
-        backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
+        // Note: Backup timer is now set in register() to ensure it works
+        // even when plugin is registered after gateway startup.
       },
       stop: async () => {
         if (backupTimer) {
@@ -3758,6 +3757,16 @@ const memoryLanceDBProPlugin = {
         api.logger.info("memory-lancedb-pro: stopped");
       },
     });
+
+    // CRITICAL FIX: Set backup timer in register() instead of start().
+    // This ensures backups work even when plugin is registered after gateway startup
+    // (e.g., when plugin is loaded on-demand by agent session).
+    if (!backupTimer) {
+      api.logger.info("memory-lancedb-pro: setting up auto-backup");
+      // Run initial backup after a short delay, then schedule daily
+      setTimeout(() => void runBackup(), 60_000); // 1 min after register
+      backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
+    }
   },
 };
 
