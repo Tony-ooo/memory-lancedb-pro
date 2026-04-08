@@ -26,10 +26,12 @@ const pkg = JSON.parse(
 );
 
 function createMockApi(pluginConfig, options = {}) {
+  const services = options.services ?? [];
   return {
     pluginConfig,
     hooks: {},
     toolFactories: {},
+    services,
     logger: {
       info() {},
       warn() {},
@@ -45,7 +47,7 @@ function createMockApi(pluginConfig, options = {}) {
     },
     registerCli() {},
     registerService(service) {
-      options.services?.push(service);
+      services.push(service);
     },
     on(name, handler) {
       this.hooks[name] = handler;
@@ -54,6 +56,12 @@ function createMockApi(pluginConfig, options = {}) {
       this.hooks[name] = handler;
     },
   };
+}
+
+async function stopRegisteredServices(api) {
+  await Promise.allSettled(
+    (api.services ?? []).map((service) => service?.stop?.()),
+  );
 }
 
 async function withFakeTimers(run) {
@@ -247,8 +255,25 @@ try {
     );
 
     await assert.doesNotReject(
+      timerServices[0].start(),
+      "service start should schedule startup lifecycle timers without throwing",
+    );
+    const startupChecksTimeout = timeouts.find((handle) => handle.delay === 0);
+    const legacyScanTimeout = timeouts.find((handle) => handle.delay === 5_000);
+    assert.ok(startupChecksTimeout, "start() should arm the startup checks timeout");
+    assert.ok(legacyScanTimeout, "start() should arm the legacy scan timeout");
+    assert.ok(
+      unrefTimeouts.includes(startupChecksTimeout.id),
+      "startup checks timeout should be unref()'d so tests can exit",
+    );
+    assert.ok(
+      unrefTimeouts.includes(legacyScanTimeout.id),
+      "legacy scan timeout should be unref()'d so tests can exit",
+    );
+
+    await assert.doesNotReject(
       timerServices[0].stop(),
-      "service stop should clear backup timers without throwing",
+      "service stop should clear lifecycle timers without throwing",
     );
     assert.ok(
       clearedTimeouts.includes(firstBackupTimeout.id),
@@ -257,6 +282,14 @@ try {
     assert.ok(
       clearedIntervals.includes(firstBackupInterval.id),
       "stop() should clear the recurring backup interval",
+    );
+    assert.ok(
+      clearedTimeouts.includes(startupChecksTimeout.id),
+      "stop() should clear the startup checks timeout",
+    );
+    assert.ok(
+      clearedTimeouts.includes(legacyScanTimeout.id),
+      "stop() should clear the legacy scan timeout",
     );
 
     const secondTimerServices = [];
@@ -294,6 +327,74 @@ try {
     assert.ok(
       clearedIntervals.includes(backupIntervals[1].id),
       "second stop() should clear the re-armed recurring backup interval",
+    );
+
+    const hotReloadPath = path.join(workDir, "db-backup-hot-reload");
+    const hotReloadFirstApi = createMockApi(
+      {
+        dbPath: hotReloadPath,
+        autoCapture: false,
+        autoRecall: false,
+        embedding: {
+          provider: "openai-compatible",
+          apiKey: "dummy",
+          model: "text-embedding-3-small",
+          baseURL: "http://127.0.0.1:9/v1",
+          dimensions: 1536,
+        },
+      },
+      { services: [] },
+    );
+    plugin.register(hotReloadFirstApi);
+    const hotReloadTimeoutBefore = timeouts.at(-1);
+    const hotReloadIntervalBefore = intervals.at(-1);
+    assert.equal(hotReloadTimeoutBefore?.delay, 60_000);
+    assert.equal(hotReloadIntervalBefore?.delay, 24 * 60 * 60 * 1000);
+
+    const hotReloadSecondApi = createMockApi(
+      {
+        dbPath: hotReloadPath,
+        autoCapture: false,
+        autoRecall: false,
+        embedding: {
+          provider: "openai-compatible",
+          apiKey: "dummy",
+          model: "text-embedding-3-small",
+          baseURL: "http://127.0.0.1:9/v1",
+          dimensions: 1536,
+        },
+      },
+      { services: [] },
+    );
+    plugin.register(hotReloadSecondApi);
+    const hotReloadTimeoutAfter = timeouts.at(-1);
+    const hotReloadIntervalAfter = intervals.at(-1);
+    assert.notEqual(
+      hotReloadTimeoutAfter?.id,
+      hotReloadTimeoutBefore?.id,
+      "same-path re-register should replace the initial backup timeout",
+    );
+    assert.notEqual(
+      hotReloadIntervalAfter?.id,
+      hotReloadIntervalBefore?.id,
+      "same-path re-register should replace the recurring backup interval",
+    );
+    assert.ok(
+      clearedTimeouts.includes(hotReloadTimeoutBefore.id),
+      "same-path re-register should clear the previous initial backup timeout",
+    );
+    assert.ok(
+      clearedIntervals.includes(hotReloadIntervalBefore.id),
+      "same-path re-register should clear the previous recurring backup interval",
+    );
+
+    await assert.doesNotReject(
+      stopRegisteredServices(hotReloadFirstApi),
+      "stale hot-reload service stop should be harmless",
+    );
+    await assert.doesNotReject(
+      stopRegisteredServices(hotReloadSecondApi),
+      "active hot-reload service stop should be harmless",
     );
   });
 
@@ -340,6 +441,7 @@ try {
     "function",
     "command:new hook should be registered (selfImprovement default-on since #391)",
   );
+  await stopRegisteredServices(sessionDefaultApi);
 
   const sessionEnabledApi = createMockApi({
     dbPath: path.join(workDir, "db-session-enabled"),
@@ -366,6 +468,7 @@ try {
     "function",
     "command:new hook should be registered (selfImprovement default-on since #391)",
   );
+  await stopRegisteredServices(sessionEnabledApi);
 
   const longText = `${"Long embedding payload. ".repeat(420)}tail`;
   const threshold = 6000;
@@ -528,6 +631,11 @@ try {
       false,
       "embedding.omitDimensions=true should omit dimensions from embedding requests",
     );
+
+    await stopRegisteredServices(chunkingOffApi);
+    await stopRegisteredServices(chunkingOnApi);
+    await stopRegisteredServices(withDimensionsApi);
+    await stopRegisteredServices(omitDimensionsApi);
   } finally {
     await new Promise((resolve) => embeddingServer.close(resolve));
   }

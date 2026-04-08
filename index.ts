@@ -1615,6 +1615,39 @@ const pluginVersion = getPluginVersion();
 // Plugin Definition
 // ============================================================================
 
+interface PluginLifecycleState {
+  resolvedDbPath: string;
+  token: number;
+  stopped: boolean;
+  backupInitialTimeout: ReturnType<typeof setTimeout> | null;
+  backupTimer: ReturnType<typeof setInterval> | null;
+  startupChecksTimeout: ReturnType<typeof setTimeout> | null;
+  legacyScanTimeout: ReturnType<typeof setTimeout> | null;
+}
+
+let nextLifecycleToken = 1;
+
+const _activeLifecyclesByDbPath = new Map<string, PluginLifecycleState>();
+
+function clearLifecycleTimers(lifecycle: PluginLifecycleState) {
+  if (lifecycle.backupInitialTimeout) {
+    clearTimeout(lifecycle.backupInitialTimeout);
+    lifecycle.backupInitialTimeout = null;
+  }
+  if (lifecycle.backupTimer) {
+    clearInterval(lifecycle.backupTimer);
+    lifecycle.backupTimer = null;
+  }
+  if (lifecycle.startupChecksTimeout) {
+    clearTimeout(lifecycle.startupChecksTimeout);
+    lifecycle.startupChecksTimeout = null;
+  }
+  if (lifecycle.legacyScanTimeout) {
+    clearTimeout(lifecycle.legacyScanTimeout);
+    lifecycle.legacyScanTimeout = null;
+  }
+}
+
 // WeakSet keyed by API instance — each distinct API object tracks its own initialized state.
 // Using WeakSet instead of a module-level boolean avoids the "second register() call skips
 // hook/tool registration for the new API instance" regression that rwmjhb identified.
@@ -1639,6 +1672,15 @@ const memoryLanceDBProPlugin = {
     const config = parsePluginConfig(api.pluginConfig);
 
     const resolvedDbPath = api.resolvePath(config.dbPath || getDefaultDbPath());
+    const lifecycle: PluginLifecycleState = {
+      resolvedDbPath,
+      token: nextLifecycleToken++,
+      stopped: false,
+      backupInitialTimeout: null,
+      backupTimer: null,
+      startupChecksTimeout: null,
+      legacyScanTimeout: null,
+    };
 
     // Pre-flight: validate storage path (symlink resolution, mkdir, write check).
     // Runs synchronously and logs warnings; does NOT block gateway startup.
@@ -3605,11 +3647,34 @@ const memoryLanceDBProPlugin = {
     // Auto-Backup (daily JSONL export)
     // ========================================================================
 
-    let backupInitialTimeout: ReturnType<typeof setTimeout> | null = null;
-    let backupTimer: ReturnType<typeof setInterval> | null = null;
     const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+    const INITIAL_BACKUP_DELAY_MS = 60_000;
+    const LEGACY_SCAN_DELAY_MS = 5_000;
 
-    async function runBackup() {
+    const isLifecycleActive = (token = lifecycle.token) =>
+      !lifecycle.stopped
+      && _activeLifecyclesByDbPath.get(resolvedDbPath)?.token === token;
+
+    const stopLifecycle = () => {
+      lifecycle.stopped = true;
+      clearLifecycleTimers(lifecycle);
+      if (_activeLifecyclesByDbPath.get(resolvedDbPath)?.token === lifecycle.token) {
+        _activeLifecyclesByDbPath.delete(resolvedDbPath);
+      }
+    };
+
+    const replacedLifecycle = _activeLifecyclesByDbPath.get(resolvedDbPath);
+    if (replacedLifecycle) {
+      replacedLifecycle.stopped = true;
+      clearLifecycleTimers(replacedLifecycle);
+      api.logger.info(
+        "memory-lancedb-pro: replaced existing runtime for the same dbPath during register()",
+      );
+    }
+    _activeLifecyclesByDbPath.set(resolvedDbPath, lifecycle);
+
+    async function runBackup(token = lifecycle.token) {
+      if (!isLifecycleActive(token)) return;
       try {
         const backupDir = api.resolvePath(
           join(resolvedDbPath, "..", "backups"),
@@ -3617,6 +3682,7 @@ const memoryLanceDBProPlugin = {
         await mkdir(backupDir, { recursive: true });
 
         const allMemories = await store.list(undefined, undefined, 10000, 0);
+        if (!isLifecycleActive(token)) return;
         if (allMemories.length === 0) return;
 
         const dateStr = new Date().toISOString().split("T")[0];
@@ -3651,34 +3717,32 @@ const memoryLanceDBProPlugin = {
           `memory-lancedb-pro: backup completed (${allMemories.length} entries → ${backupFile})`,
         );
       } catch (err) {
+        if (!isLifecycleActive(token)) return;
         api.logger.warn(`memory-lancedb-pro: backup failed: ${String(err)}`);
       }
     }
 
     function clearBackupTimers() {
-      if (backupInitialTimeout) {
-        clearTimeout(backupInitialTimeout);
-        backupInitialTimeout = null;
-      }
-      if (backupTimer) {
-        clearInterval(backupTimer);
-        backupTimer = null;
-      }
+      clearLifecycleTimers(lifecycle);
     }
 
     function setupBackupTimers() {
-      if (backupInitialTimeout || backupTimer) return;
+      if (lifecycle.backupInitialTimeout || lifecycle.backupTimer) return;
 
       api.logger.info("memory-lancedb-pro: setting up auto-backup");
 
-      backupInitialTimeout = setTimeout(() => {
-        backupInitialTimeout = null;
+      lifecycle.backupInitialTimeout = setTimeout(() => {
+        lifecycle.backupInitialTimeout = null;
+        if (!isLifecycleActive()) return;
         void runBackup();
-      }, 60_000);
-      backupInitialTimeout.unref?.();
+      }, INITIAL_BACKUP_DELAY_MS);
+      lifecycle.backupInitialTimeout.unref?.();
 
-      backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
-      backupTimer.unref?.();
+      lifecycle.backupTimer = setInterval(() => {
+        if (!isLifecycleActive()) return;
+        void runBackup();
+      }, BACKUP_INTERVAL_MS);
+      lifecycle.backupTimer.unref?.();
     }
 
     // ========================================================================
@@ -3703,6 +3767,7 @@ const memoryLanceDBProPlugin = {
               () => reject(new Error(`${label} timed out after ${ms}ms`)),
               ms,
             );
+            timeout.unref?.();
           });
           try {
             return await Promise.race([p, timeoutPromise]);
@@ -3711,7 +3776,8 @@ const memoryLanceDBProPlugin = {
           }
         };
 
-        const runStartupChecks = async () => {
+        const runStartupChecks = async (token = lifecycle.token) => {
+          if (!isLifecycleActive(token)) return;
           try {
             // Test components (bounded time)
             const embedTest = await withTimeout(
@@ -3724,6 +3790,7 @@ const memoryLanceDBProPlugin = {
               8_000,
               "retriever.test()",
             );
+            if (!isLifecycleActive(token)) return;
 
             api.logger.info(
               `memory-lancedb-pro: initialized successfully ` +
@@ -3748,6 +3815,7 @@ const memoryLanceDBProPlugin = {
             embedHealth = { ok: !!embedTest.success, error: embedTest.error };
             retrievalHealth = !!retrievalTest.success;
           } catch (error) {
+            if (!isLifecycleActive(token)) return;
             api.logger.warn(
               `memory-lancedb-pro: startup checks failed: ${String(error)}`,
             );
@@ -3755,13 +3823,27 @@ const memoryLanceDBProPlugin = {
         };
 
         // Fire-and-forget: allow gateway to start serving immediately.
-        setTimeout(() => void runStartupChecks(), 0);
+        if (lifecycle.startupChecksTimeout) {
+          clearTimeout(lifecycle.startupChecksTimeout);
+        }
+        lifecycle.startupChecksTimeout = setTimeout(() => {
+          lifecycle.startupChecksTimeout = null;
+          if (!isLifecycleActive()) return;
+          void runStartupChecks();
+        }, 0);
+        lifecycle.startupChecksTimeout.unref?.();
 
         // Check for legacy memories that could be upgraded
-        setTimeout(async () => {
+        if (lifecycle.legacyScanTimeout) {
+          clearTimeout(lifecycle.legacyScanTimeout);
+        }
+        lifecycle.legacyScanTimeout = setTimeout(async () => {
+          lifecycle.legacyScanTimeout = null;
+          if (!isLifecycleActive()) return;
           try {
             const upgrader = createMemoryUpgrader(store, null);
             const counts = await upgrader.countLegacy();
+            if (!isLifecycleActive()) return;
             if (counts.legacy > 0) {
               api.logger.info(
                 `memory-lancedb-pro: found ${counts.legacy} legacy memories (of ${counts.total} total) that can be upgraded to the new smart memory format. ` +
@@ -3771,13 +3853,14 @@ const memoryLanceDBProPlugin = {
           } catch {
             // Non-critical: silently ignore
           }
-        }, 5_000);
+        }, LEGACY_SCAN_DELAY_MS);
+        lifecycle.legacyScanTimeout.unref?.();
 
         // Note: Backup timer is now set in register() to ensure it works
         // even when plugin is registered after gateway startup.
       },
       stop: async () => {
-        clearBackupTimers();
+        stopLifecycle();
         api.logger.info("memory-lancedb-pro: stopped");
       },
     });

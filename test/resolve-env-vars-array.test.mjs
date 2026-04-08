@@ -50,6 +50,7 @@ async function withTestEnv(apiKeyConfig, fn) {
   const dbPath = path.join(workDir, "test.db");
   const embeddingServer = createEmbeddingServer();
   const llmServer = createLlmServer();
+  let api;
   await new Promise((r) => embeddingServer.listen(0, "127.0.0.1", r));
   await new Promise((r) => llmServer.listen(0, "127.0.0.1", r));
   const ePort = embeddingServer.address().port;
@@ -57,7 +58,7 @@ async function withTestEnv(apiKeyConfig, fn) {
 
   try {
     const logs = [];
-    const api = {
+    api = {
       pluginConfig: {
         dbPath,
         autoCapture: false,
@@ -99,6 +100,7 @@ async function withTestEnv(apiKeyConfig, fn) {
     plugin.register(api);
     await fn(logs);
   } finally {
+    await Promise.allSettled((api?.services ?? []).map((service) => service?.stop?.()));
     await new Promise((r) => embeddingServer.close(r));
     await new Promise((r) => llmServer.close(r));
     rmSync(workDir, { recursive: true, force: true });

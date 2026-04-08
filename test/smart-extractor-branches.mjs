@@ -28,6 +28,8 @@ const EMBEDDING_DIMENSIONS = 2560;
 // mock embeddings do not accidentally classify normal user text as noise.
 NoisePrototypeBank.prototype.isNoise = () => false;
 
+const registeredServices = new Set();
+
 function createDeterministicEmbedding(text, dimensions = EMBEDDING_DIMENSIONS) {
   void text;
   const value = 1 / Math.sqrt(dimensions);
@@ -133,6 +135,7 @@ function createMockApi(dbPath, embeddingBaseURL, llmBaseURL, logs) {
     registerCli() {},
     registerService(service) {
       this.services.push(service);
+      registeredServices.add(service);
     },
     on(name, handler) {
       this.hooks[name] = handler;
@@ -141,6 +144,12 @@ function createMockApi(dbPath, embeddingBaseURL, llmBaseURL, logs) {
       this.hooks[name] = handler;
     },
   };
+}
+
+async function stopRegisteredServices() {
+  const services = Array.from(registeredServices);
+  registeredServices.clear();
+  await Promise.allSettled(services.map((service) => service?.stop?.()));
 }
 
 async function runAgentEndHook(api, event, ctx) {
@@ -296,6 +305,7 @@ async function runScenario(mode) {
 
     return { entries, llmCalls, logs };
   } finally {
+    await stopRegisteredServices();
     delete process.env.TEST_EMBEDDING_BASE_URL;
     await new Promise((resolve) => embeddingServer.close(resolve));
     await new Promise((resolve) => server.close(resolve));
@@ -475,6 +485,7 @@ async function runMultiRoundScenario() {
     const entries = await freshStore.list(["agent:life"], undefined, 10, 0);
     return { entries, extractionCall, dedupCall, mergeCall, logs };
   } finally {
+    await stopRegisteredServices();
     delete process.env.TEST_EMBEDDING_BASE_URL;
     await new Promise((resolve) => embeddingServer.close(resolve));
     await new Promise((resolve) => server.close(resolve));
@@ -570,6 +581,7 @@ async function runInjectedRecallScenario() {
 
     return { llmCalls, logs };
   } finally {
+    await stopRegisteredServices();
     delete process.env.TEST_EMBEDDING_BASE_URL;
     await new Promise((resolve) => embeddingServer.close(resolve));
     await new Promise((resolve) => server.close(resolve));
@@ -664,6 +676,7 @@ async function runPrependedRecallWithUserTextScenario() {
 
     return { llmCalls, logs };
   } finally {
+    await stopRegisteredServices();
     delete process.env.TEST_EMBEDDING_BASE_URL;
     await new Promise((resolve) => embeddingServer.close(resolve));
     await new Promise((resolve) => server.close(resolve));
@@ -754,6 +767,7 @@ async function runInboundMetadataWrappedScenario() {
 
     return { llmCalls, logs };
   } finally {
+    await stopRegisteredServices();
     delete process.env.TEST_EMBEDDING_BASE_URL;
     await new Promise((resolve) => embeddingServer.close(resolve));
     await new Promise((resolve) => server.close(resolve));
@@ -827,6 +841,7 @@ async function runSessionDeltaScenario() {
 
     return logs;
   } finally {
+    await stopRegisteredServices();
     delete process.env.TEST_EMBEDDING_BASE_URL;
     await new Promise((resolve) => embeddingServer.close(resolve));
     rmSync(workDir, { recursive: true, force: true });
@@ -876,6 +891,7 @@ async function runPendingIngressScenario() {
 
     return logs;
   } finally {
+    await stopRegisteredServices();
     delete process.env.TEST_EMBEDDING_BASE_URL;
     await new Promise((resolve) => embeddingServer.close(resolve));
     rmSync(workDir, { recursive: true, force: true });
@@ -944,6 +960,7 @@ async function runRememberCommandContextScenario() {
 
     return logs;
   } finally {
+    await stopRegisteredServices();
     delete process.env.TEST_EMBEDDING_BASE_URL;
     await new Promise((resolve) => embeddingServer.close(resolve));
     rmSync(workDir, { recursive: true, force: true });
@@ -1055,6 +1072,7 @@ async function runUserMdExclusiveProfileScenario() {
     const entries = await store.list(["agent:life"], undefined, 10, 0);
     return { entries, logs };
   } finally {
+    await stopRegisteredServices();
     await new Promise((resolve) => embeddingServer.close(resolve));
     await new Promise((resolve) => llmServer.close(resolve));
     rmSync(workDir, { recursive: true, force: true });
@@ -1153,6 +1171,7 @@ async function runBoundarySkipKeepsRegexFallbackScenario() {
     const entries = await store.list(["agent:life"], undefined, 10, 0);
     return { entries, logs };
   } finally {
+    await stopRegisteredServices();
     await new Promise((resolve) => embeddingServer.close(resolve));
     await new Promise((resolve) => llmServer.close(resolve));
     rmSync(workDir, { recursive: true, force: true });
@@ -1287,6 +1306,7 @@ async function runInboundMetadataCleanupScenario() {
     const entries = await freshStore.list(["global", "agent:main"], undefined, 10, 0);
     return { entries, llmCalls, logs, extractionPrompt };
   } finally {
+    await stopRegisteredServices();
     delete process.env.TEST_EMBEDDING_BASE_URL;
     await new Promise((resolve) => embeddingServer.close(resolve));
     await new Promise((resolve) => server.close(resolve));

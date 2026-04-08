@@ -83,9 +83,11 @@ describe("systemSessionMemory before_reset", () => {
   let workDir;
   let embeddingServer;
   let embeddingBaseURL;
+  let apis;
 
   beforeEach(async () => {
     workDir = mkdtempSync(path.join(tmpdir(), "memory-session-summary-"));
+    apis = [];
     embeddingServer = createEmbeddingServer();
     await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
     const port = embeddingServer.address().port;
@@ -93,6 +95,9 @@ describe("systemSessionMemory before_reset", () => {
   });
 
   afterEach(async () => {
+    await Promise.allSettled(
+      apis.flatMap((api) => (api.services ?? []).map((service) => service?.stop?.())),
+    );
     await new Promise((resolve) => embeddingServer.close(resolve));
     rmSync(workDir, { recursive: true, force: true });
   });
@@ -100,6 +105,7 @@ describe("systemSessionMemory before_reset", () => {
   it("stores a session-summary row for /new using before_reset messages", async () => {
     const dbPath = path.join(workDir, "db");
     const api = createApiHarness({ dbPath, embeddingBaseURL });
+    apis.push(api);
 
     memoryLanceDBProPlugin.register(api);
 
@@ -141,6 +147,7 @@ describe("systemSessionMemory before_reset", () => {
   it("skips writes for /reset", async () => {
     const dbPath = path.join(workDir, "db-reset");
     const api = createApiHarness({ dbPath, embeddingBaseURL });
+    apis.push(api);
 
     memoryLanceDBProPlugin.register(api);
 
